@@ -1,32 +1,21 @@
 import type { ServiceImpl } from "@connectrpc/connect";
-import {
-  and,
-  db,
-  desc,
-  eq,
-  inArray,
-  isNotNull,
-  isNull,
-  sql,
-} from "@openstatus/db";
+import { and, db, desc, eq, inArray, sql } from "@openstatus/db";
 
 // Type that works with both db instance and transaction
 type DB = typeof db;
 type Transaction = Parameters<Parameters<DB["transaction"]>[0]>[0];
 import {
-  page,
   pageComponent,
-  pageSubscriber,
   statusReport,
   statusReportUpdate,
   statusReportsToPageComponents,
 } from "@openstatus/db/src/schema";
 import type { Limits } from "@openstatus/db/src/schema/plan/schema";
-import { EmailClient } from "@openstatus/emails";
 import type { StatusReportService } from "@openstatus/proto/status_report/v1";
 import { StatusReportStatus } from "@openstatus/proto/status_report/v1";
 
-import { env } from "@/env";
+import { dispatchStatusReportUpdate } from "@openstatus/subscriptions";
+
 import { getRpcContext } from "../../interceptors";
 import {
   dbReportToProto,
@@ -44,89 +33,21 @@ import {
   statusReportUpdateFailedError,
 } from "./errors";
 
-const emailClient = new EmailClient({ apiKey: env.RESEND_API_KEY });
-
 /**
  * Helper to send status report notifications to page subscribers.
+ * Uses the subscription dispatcher for component-aware filtering.
  */
 export async function sendStatusReportNotification(params: {
-  statusReportId: number;
-  pageId: number;
-  reportTitle: string;
-  status: "investigating" | "identified" | "monitoring" | "resolved";
-  message: string;
-  date: Date;
+  statusReportUpdateId: number;
   limits: Limits;
 }) {
-  const { statusReportId, pageId, reportTitle, status, message, date, limits } =
-    params;
+  const { statusReportUpdateId, limits } = params;
 
-  // Check if workspace has status-subscribers feature enabled
   if (!limits["status-subscribers"]) {
     return;
   }
 
-  // Get page info
-  const pageInfo = await db.query.page.findFirst({
-    where: eq(page.id, pageId),
-  });
-
-  if (!pageInfo) {
-    return;
-  }
-
-  // Get verified subscribers who haven't unsubscribed
-  const subscribers = await db
-    .select()
-    .from(pageSubscriber)
-    .where(
-      and(
-        eq(pageSubscriber.pageId, pageId),
-        isNotNull(pageSubscriber.acceptedAt),
-        isNull(pageSubscriber.unsubscribedAt),
-      ),
-    )
-    .all();
-
-  const validSubscribers = subscribers.filter(
-    (s): s is typeof s & { token: string } =>
-      s.token !== null && s.acceptedAt !== null && s.unsubscribedAt === null,
-  );
-
-  if (validSubscribers.length === 0) {
-    return;
-  }
-
-  // Get page components for this status report
-  const statusReportWithComponents = await db.query.statusReport.findFirst({
-    where: eq(statusReport.id, statusReportId),
-    with: {
-      statusReportsToPageComponents: {
-        with: { pageComponent: true },
-      },
-    },
-  });
-
-  const pageComponents =
-    statusReportWithComponents?.statusReportsToPageComponents.map(
-      (i) => i.pageComponent.name,
-    ) ?? [];
-
-  // Send notification emails
-  await emailClient.sendStatusReportUpdate({
-    subscribers: validSubscribers.map((subscriber) => ({
-      email: subscriber.email,
-      token: subscriber.token,
-    })),
-    pageTitle: pageInfo.title,
-    pageSlug: pageInfo.slug,
-    customDomain: pageInfo.customDomain,
-    reportTitle,
-    status,
-    message,
-    date: date.toISOString(),
-    pageComponents,
-  });
+  await dispatchStatusReportUpdate(statusReportUpdateId);
 }
 
 /**
@@ -273,7 +194,11 @@ export const statusReportServiceImpl: ServiceImpl<typeof StatusReportService> =
       const date = parseDate(req.date);
 
       // Create status report, associations, and initial update in a transaction
-      const { report: newReport, pageId } = await db.transaction(async (tx) => {
+      const {
+        report: newReport,
+        newUpdate,
+        pageId,
+      } = await db.transaction(async (tx) => {
         // Validate page component IDs inside transaction to prevent TOCTOU race condition
         const validatedComponents = await validatePageComponentIds(
           req.pageComponentIds,
@@ -296,8 +221,9 @@ export const statusReportServiceImpl: ServiceImpl<typeof StatusReportService> =
           );
         }
 
-        // Use the derived pageId from components (null if no components)
-        const pageId = Number(providedPageId);
+        // Use the derived pageId from components, or parse the provided one
+        const pageId =
+          derivedPageId ?? (providedPageId ? Number(providedPageId) : null);
 
         // Create the status report
         const report = await tx
@@ -338,18 +264,13 @@ export const statusReportServiceImpl: ServiceImpl<typeof StatusReportService> =
           throw statusReportCreateFailedError();
         }
 
-        return { report, pageId };
+        return { report, newUpdate, pageId };
       });
 
       // Send notifications if requested (outside transaction)
       if (req.notify) {
         await sendStatusReportNotification({
-          statusReportId: newReport.id,
-          pageId,
-          reportTitle: newReport.title,
-          status: protoStatusToDb(req.status),
-          message: req.message,
-          date,
+          statusReportUpdateId: newUpdate.id,
           limits: rpcCtx.workspace.limits,
         });
       }
@@ -544,7 +465,7 @@ export const statusReportServiceImpl: ServiceImpl<typeof StatusReportService> =
       const date = req.date ? parseDate(req.date) : new Date();
 
       // Create update and update status report in a transaction
-      const updatedReport = await db.transaction(async (tx) => {
+      const { updatedReport, newUpdate } = await db.transaction(async (tx) => {
         // Create the update
         const newUpdate = await tx
           .insert(statusReportUpdate)
@@ -576,18 +497,13 @@ export const statusReportServiceImpl: ServiceImpl<typeof StatusReportService> =
           throw statusReportUpdateFailedError(req.statusReportId);
         }
 
-        return updated;
+        return { updatedReport: updated, newUpdate };
       });
 
       // Send notifications if requested (outside transaction)
       if (req.notify && updatedReport.pageId) {
         await sendStatusReportNotification({
-          statusReportId: updatedReport.id,
-          pageId: updatedReport.pageId,
-          reportTitle: updatedReport.title,
-          status: protoStatusToDb(req.status),
-          message: req.message,
-          date,
+          statusReportUpdateId: newUpdate.id,
           limits: rpcCtx.workspace.limits,
         });
       }

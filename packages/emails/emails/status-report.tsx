@@ -31,7 +31,8 @@ export const StatusReportSchema = z.object({
   message: z.string(),
   reportTitle: z.string(),
   pageComponents: z.array(z.string()),
-  unsubscribeUrl: z.string().url().optional(),
+  unsubscribeUrl: z.url(),
+  manageUrl: z.url(),
 });
 
 export type StatusReportProps = z.infer<typeof StatusReportSchema>;
@@ -61,6 +62,7 @@ function StatusReportEmail({
   pageTitle,
   pageComponents,
   unsubscribeUrl,
+  manageUrl,
 }: StatusReportProps) {
   return (
     <Html>
@@ -123,7 +125,13 @@ function StatusReportEmail({
                 >
                   Unsubscribe
                 </Link>{" "}
-                from these notifications.
+                ・{" "}
+                <Link
+                  href={manageUrl}
+                  style={{ color: "#6b7280", textDecoration: "underline" }}
+                >
+                  Manage notifications
+                </Link>
               </Text>
             </Section>
           )}
@@ -163,6 +171,8 @@ We'll post another update by **19:00 UTC** today or sooner if critical developme
   pageComponents: ["OpenStatus API", "OpenStatus Webhook"],
   unsubscribeUrl:
     "https://status.openstatus.dev/unsubscribe/550e8400-e29b-41d4-a716-446655440000",
+  manageUrl:
+    "https://status.openstatus.dev/manage/550e8400-e29b-41d4-a716-446655440000",
 };
 
 export default StatusReportEmail;
